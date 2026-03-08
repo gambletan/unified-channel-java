@@ -12,6 +12,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -247,6 +248,185 @@ class ChannelManagerTest {
         assertTrue(latch.await(5, TimeUnit.SECONDS));
     }
 
+    // --- New tests ---
+
+    @Test
+    void broadcastWithPartialFailures() throws Exception {
+        var failAdapter = new FailingSendAdapter("fail-channel");
+        manager.addChannel(adapter1).addChannel(failAdapter);
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        var msg = OutboundMessage.text("c1", "broadcast");
+        // broadcast should complete even when one adapter fails
+        manager.broadcast(msg).get(5, TimeUnit.SECONDS);
+
+        // adapter1 should have received the message
+        assertEquals(1, adapter1.sentMessages.size());
+    }
+
+    @Test
+    void broadcastSkipsDisconnectedChannels() throws Exception {
+        manager.addChannel(adapter1).addChannel(adapter2);
+        // Only connect adapter1
+        adapter1.connect().get();
+        // adapter2 remains disconnected
+
+        var msg = OutboundMessage.text("c1", "broadcast");
+        manager.broadcast(msg).get(5, TimeUnit.SECONDS);
+
+        assertEquals(1, adapter1.sentMessages.size());
+        assertEquals(0, adapter2.sentMessages.size());
+    }
+
+    @Test
+    void getStatusWithMixedStates() throws Exception {
+        var errorAdapter = new MockAdapter("error-channel");
+        manager.addChannel(adapter1).addChannel(adapter2).addChannel(errorAdapter);
+
+        adapter1.connect().get();
+        // adapter2 stays disconnected
+        errorAdapter.status = ChannelStatus.error("error-channel", "Connection refused");
+
+        var statuses = manager.getStatus();
+        assertEquals(3, statuses.size());
+        assertEquals(ChannelStatus.State.CONNECTED, statuses.get("channel1").state());
+        assertEquals(ChannelStatus.State.DISCONNECTED, statuses.get("channel2").state());
+        assertEquals(ChannelStatus.State.ERROR, statuses.get("error-channel").state());
+        assertEquals("Connection refused", statuses.get("error-channel").error());
+    }
+
+    @Test
+    void middlewarePipelineOrdering() throws Exception {
+        var order = new CopyOnWriteArrayList<String>();
+
+        Middleware mw1 = (msg, next) -> {
+            order.add("mw1-before");
+            return next.handle(msg).thenApply(r -> {
+                order.add("mw1-after");
+                return r;
+            });
+        };
+        Middleware mw2 = (msg, next) -> {
+            order.add("mw2-before");
+            return next.handle(msg).thenApply(r -> {
+                order.add("mw2-after");
+                return r;
+            });
+        };
+
+        var latch = new CountDownLatch(1);
+        manager.addChannel(adapter1);
+        manager.addMiddleware(mw1);
+        manager.addMiddleware(mw2);
+        manager.onMessage(msg -> {
+            order.add("terminal");
+            latch.countDown();
+        });
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        adapter1.simulateInbound(UnifiedMessage.builder()
+                .channelId("channel1")
+                .sender(new Identity("u1"))
+                .chatId("c1")
+                .content(MessageContent.text("test"))
+                .build());
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+        Thread.sleep(50); // let thenApply finish
+
+        assertEquals(List.of("mw1-before", "mw2-before", "terminal", "mw2-after", "mw1-after"), order);
+    }
+
+    @Test
+    void errorInPipelineAsyncDoesNotCrash() throws Exception {
+        // Middleware that returns a failed future (async error)
+        Middleware errorMw = (msg, next) ->
+                CompletableFuture.failedFuture(new RuntimeException("async middleware explosion"));
+
+        manager.addChannel(adapter1);
+        manager.addMiddleware(errorMw);
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        // Should not throw; error is logged internally via .handle()
+        adapter1.simulateInbound(UnifiedMessage.builder()
+                .channelId("channel1")
+                .sender(new Identity("u1"))
+                .chatId("c1")
+                .content(MessageContent.text("boom"))
+                .build());
+
+        Thread.sleep(100);
+        // No assertion needed - just verifying no exception propagates
+    }
+
+    @Test
+    void shutdownIsIdempotent() throws Exception {
+        manager.addChannel(adapter1);
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        manager.shutdown().get(5, TimeUnit.SECONDS);
+        assertFalse(manager.isRunning());
+
+        // Second shutdown should not fail
+        manager.shutdown().get(5, TimeUnit.SECONDS);
+        assertFalse(manager.isRunning());
+    }
+
+    @Test
+    void multipleListenersAllReceiveMessages() throws Exception {
+        var received1 = new CopyOnWriteArrayList<UnifiedMessage>();
+        var received2 = new CopyOnWriteArrayList<UnifiedMessage>();
+        var latch = new CountDownLatch(2);
+
+        manager.addChannel(adapter1);
+        manager.onMessage(msg -> { received1.add(msg); latch.countDown(); });
+        manager.onMessage(msg -> { received2.add(msg); latch.countDown(); });
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        adapter1.simulateInbound(UnifiedMessage.builder()
+                .channelId("channel1")
+                .sender(new Identity("u1"))
+                .chatId("c1")
+                .content(MessageContent.text("hello"))
+                .build());
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+        assertEquals(1, received1.size());
+        assertEquals(1, received2.size());
+    }
+
+    @Test
+    void listenerExceptionDoesNotAffectOthers() throws Exception {
+        var received = new CopyOnWriteArrayList<UnifiedMessage>();
+        var latch = new CountDownLatch(1);
+
+        manager.addChannel(adapter1);
+        manager.onMessage(msg -> { throw new RuntimeException("listener crash"); });
+        manager.onMessage(msg -> { received.add(msg); latch.countDown(); });
+        manager.run().get(5, TimeUnit.SECONDS);
+
+        adapter1.simulateInbound(UnifiedMessage.builder()
+                .channelId("channel1")
+                .sender(new Identity("u1"))
+                .chatId("c1")
+                .content(MessageContent.text("hello"))
+                .build());
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+        assertEquals(1, received.size());
+    }
+
+    @Test
+    void chainingAddChannelAndMiddleware() {
+        var access = new AccessMiddleware();
+        var result = manager
+                .addChannel(adapter1)
+                .addChannel(adapter2)
+                .addMiddleware(access);
+        assertSame(manager, result);
+        assertEquals(2, manager.getChannelIds().size());
+    }
+
     // --- Mock Adapter ---
 
     static class MockAdapter implements ChannelAdapter {
@@ -292,6 +472,18 @@ class ChannelManagerTest {
             for (var listener : listeners) {
                 listener.accept(msg);
             }
+        }
+    }
+
+    /** Adapter that fails on send. */
+    static class FailingSendAdapter extends MockAdapter {
+        FailingSendAdapter(String id) {
+            super(id);
+        }
+
+        @Override
+        public CompletableFuture<Void> send(OutboundMessage message) {
+            return CompletableFuture.failedFuture(new RuntimeException("send failed"));
         }
     }
 }

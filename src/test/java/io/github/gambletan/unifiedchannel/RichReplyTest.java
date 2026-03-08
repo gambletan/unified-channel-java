@@ -141,4 +141,123 @@ class RichReplyTest {
         assertTrue(text.contains("```json"));
         assertTrue(text.contains("[Restart Cache]"));
     }
+
+    // --- New tests ---
+
+    @Test
+    void emptyReply() {
+        var reply = new RichReply();
+        assertEquals("", reply.toPlainText());
+        assertTrue(reply.getParts().isEmpty());
+    }
+
+    @Test
+    void tableRenderingAlignedColumns() {
+        var reply = new RichReply()
+                .table(List.of("ID", "Name", "Status"),
+                        List.of(
+                                List.of("1", "Short", "OK"),
+                                List.of("100", "VeryLongName", "ERROR")));
+        var text = reply.toPlainText();
+        // Verify table structure: header, separator, data rows
+        var lines = text.split("\n");
+        assertTrue(lines.length >= 4); // header + separator + 2 data rows
+        assertTrue(lines[1].contains("-")); // separator line
+    }
+
+    @Test
+    void tableWithEmptyRows() {
+        var reply = new RichReply()
+                .table(List.of("Col1", "Col2"), List.of());
+        var text = reply.toPlainText();
+        assertTrue(text.contains("Col1"));
+        assertTrue(text.contains("Col2"));
+        // Just header + separator, no data rows
+    }
+
+    @Test
+    void codeBlockPreservesContent() {
+        var code = "function hello() {\n  console.log('world');\n}";
+        var reply = new RichReply().code(code, "js");
+        var text = reply.toPlainText();
+        assertTrue(text.contains("```js"));
+        assertTrue(text.contains(code));
+        assertTrue(text.endsWith("```"));
+    }
+
+    @Test
+    void multipleSections() {
+        var reply = new RichReply()
+                .text("Section 1")
+                .divider()
+                .text("Section 2")
+                .divider()
+                .text("Section 3");
+
+        var text = reply.toPlainText();
+        assertTrue(text.contains("Section 1"));
+        assertTrue(text.contains("Section 2"));
+        assertTrue(text.contains("Section 3"));
+
+        var parts = reply.getParts();
+        assertEquals(5, parts.size());
+        assertInstanceOf(RichReply.TextPart.class, parts.get(0));
+        assertInstanceOf(RichReply.DividerPart.class, parts.get(1));
+        assertInstanceOf(RichReply.TextPart.class, parts.get(2));
+        assertInstanceOf(RichReply.DividerPart.class, parts.get(3));
+        assertInstanceOf(RichReply.TextPart.class, parts.get(4));
+    }
+
+    @Test
+    void toOutboundForDifferentChannels() {
+        var reply = new RichReply().text("Hello");
+
+        var telegram = reply.toOutbound("telegram", "tg-chat");
+        assertEquals("tg-chat", telegram.chatId());
+        assertEquals("Hello", telegram.text());
+
+        var discord = reply.toOutbound("discord", "dc-chat");
+        assertEquals("dc-chat", discord.chatId());
+        assertEquals("Hello", discord.text());
+
+        var slack = reply.toOutbound("slack", "sl-chat");
+        assertEquals("sl-chat", slack.chatId());
+        assertEquals("Hello", slack.text());
+    }
+
+    @Test
+    void toOutboundWithoutButtons() {
+        var reply = new RichReply().text("No buttons");
+        var outbound = reply.toOutbound("test", "c1");
+        assertTrue(outbound.buttons().isEmpty());
+    }
+
+    @Test
+    void nullTextThrows() {
+        var reply = new RichReply();
+        assertThrows(NullPointerException.class, () -> reply.text(null));
+    }
+
+    @Test
+    void nullCodeThrows() {
+        var reply = new RichReply();
+        assertThrows(NullPointerException.class, () -> reply.code(null, "java"));
+    }
+
+    @Test
+    void nullImageUrlThrows() {
+        var reply = new RichReply();
+        assertThrows(NullPointerException.class, () -> reply.image(null, "alt"));
+    }
+
+    @Test
+    void partRecordEquality() {
+        var p1 = new RichReply.TextPart("hello");
+        var p2 = new RichReply.TextPart("hello");
+        assertEquals(p1, p2);
+
+        var c1 = new RichReply.CodePart("x", "java");
+        var c2 = new RichReply.CodePart("x", "java");
+        assertEquals(c1, c2);
+    }
 }
