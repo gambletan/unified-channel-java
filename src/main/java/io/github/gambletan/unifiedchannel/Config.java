@@ -192,7 +192,7 @@ public final class Config {
             case "slack" -> new SlackAdapter(str(props, "botToken"), str(props, "appToken"));
             case "mattermost" -> new MattermostAdapter(str(props, "serverUrl"), str(props, "token"));
             case "irc" -> new IRCAdapter(str(props, "server"),
-                    Integer.parseInt(str(props, "port", "6667")),
+                    parsePort(str(props, "port", "6667"), 6667),
                     str(props, "nick"),
                     str(props, "channel"));
             case "whatsapp" -> new WhatsAppAdapter(str(props, "phoneNumberId"), str(props, "accessToken"));
@@ -221,5 +221,13 @@ public final class Config {
     private static String str(Map<String, Object> props, String key, String defaultValue) {
         var val = props.get(key);
         return val != null ? val.toString() : defaultValue;
+    }
+
+    private static int parsePort(String value, int defaultPort) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultPort;
+        }
     }
 }

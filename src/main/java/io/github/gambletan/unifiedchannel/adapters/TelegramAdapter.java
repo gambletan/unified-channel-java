@@ -145,7 +145,12 @@ public final class TelegramAdapter extends AbstractAdapter {
         }
 
         var chatId = chatMatch.group(1);
-        var text = textMatch.group(1).replace("\\\"", "\"").replace("\\n", "\n");
+        var text = textMatch.group(1)
+                .replace("\\\\", "\\")
+                .replace("\\\"", "\"")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t");
         var fromId = fromIdMatch.group(1);
         var msgId = msgIdMatch.find() ? msgIdMatch.group(1) : null;
 
