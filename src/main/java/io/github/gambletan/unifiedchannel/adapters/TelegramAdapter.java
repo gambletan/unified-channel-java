@@ -2,10 +2,15 @@ package io.github.gambletan.unifiedchannel.adapters;
 
 import io.github.gambletan.unifiedchannel.*;
 
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -18,9 +23,37 @@ import java.util.regex.Pattern;
 /**
  * Telegram Bot API adapter using java.net.http (no external dependencies).
  * <p>
- * Uses long polling via getUpdates. For production, consider switching to webhooks.
+ * Supports two modes:
+ * <ul>
+ *   <li>{@code POLLING} (default): long polling via getUpdates</li>
+ *   <li>{@code WEBHOOK}: starts a local HTTP server and registers a webhook URL with Telegram</li>
+ * </ul>
  */
 public final class TelegramAdapter extends AbstractAdapter {
+
+    /** Receive mode for the Telegram adapter. */
+    public enum Mode { POLLING, WEBHOOK }
+
+    /** Configuration for webhook mode. */
+    public static final class WebhookConfig {
+        private final String webhookUrl;
+        private final int port;
+        private final String path;
+
+        public WebhookConfig(String webhookUrl) {
+            this(webhookUrl, 8443, "/telegram-webhook");
+        }
+
+        public WebhookConfig(String webhookUrl, int port, String path) {
+            this.webhookUrl = webhookUrl;
+            this.port = port;
+            this.path = path;
+        }
+
+        public String webhookUrl() { return webhookUrl; }
+        public int port() { return port; }
+        public String path() { return path; }
+    }
 
     private static final String API_BASE = "https://api.telegram.org/bot";
     // Simple JSON field extractors (avoids GSON dependency for core)
@@ -34,15 +67,31 @@ public final class TelegramAdapter extends AbstractAdapter {
 
     private final String token;
     private final HttpClient httpClient;
+    private final Mode mode;
+    private final WebhookConfig webhookConfig;
     private final AtomicLong offset = new AtomicLong(0);
     private ScheduledExecutorService poller;
     private volatile boolean polling;
+    private HttpServer webhookServer;
 
+    /** Create a polling-mode adapter. */
     public TelegramAdapter(String token) {
+        this(token, Mode.POLLING, null);
+    }
+
+    /** Create an adapter with explicit mode and optional webhook config. */
+    public TelegramAdapter(String token, Mode mode, WebhookConfig webhookConfig) {
         this.token = token;
+        this.mode = mode;
+        this.webhookConfig = webhookConfig;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
+    }
+
+    /** Returns the current mode (POLLING or WEBHOOK). */
+    public Mode mode() {
+        return mode;
     }
 
     @Override
@@ -59,15 +108,23 @@ public final class TelegramAdapter extends AbstractAdapter {
                 throw new RuntimeException("Telegram getMe failed");
             }
             status = ChannelStatus.connected(channelId());
-            startPolling();
+            if (mode == Mode.WEBHOOK) {
+                startWebhookServer();
+            } else {
+                startPolling();
+            }
         });
     }
 
     @Override
     public CompletableFuture<Void> disconnect() {
-        polling = false;
-        if (poller != null) {
-            poller.shutdown();
+        if (mode == Mode.WEBHOOK) {
+            stopWebhookServer();
+        } else {
+            polling = false;
+            if (poller != null) {
+                poller.shutdown();
+            }
         }
         status = ChannelStatus.disconnected(channelId());
         return CompletableFuture.completedFuture(null);
@@ -110,6 +167,70 @@ public final class TelegramAdapter extends AbstractAdapter {
             }
         }
     }
+
+    // -- Webhook --
+
+    private void startWebhookServer() {
+        if (webhookConfig == null) {
+            throw new IllegalStateException("webhookConfig is required for WEBHOOK mode");
+        }
+
+        try {
+            var fullUrl = webhookConfig.webhookUrl().replaceAll("/+$", "") + webhookConfig.path();
+
+            // Register webhook with Telegram
+            var setWebhookJson = "{\"url\":\"" + escapeJson(fullUrl) + "\"}";
+            apiPost("setWebhook", setWebhookJson).join();
+
+            // Start local HTTP server
+            webhookServer = HttpServer.create(new InetSocketAddress(webhookConfig.port()), 0);
+            webhookServer.createContext(webhookConfig.path(), exchange -> {
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    exchange.sendResponseHeaders(405, -1);
+                    exchange.close();
+                    return;
+                }
+                try {
+                    var body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                    processUpdates(body);
+                    var resp = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, resp.length);
+                    exchange.getResponseBody().write(resp);
+                } catch (Exception e) {
+                    log.warning("Webhook handler error: " + e.getMessage());
+                    exchange.sendResponseHeaders(400, -1);
+                } finally {
+                    exchange.close();
+                }
+            });
+            webhookServer.setExecutor(Executors.newCachedThreadPool(r -> {
+                var t = new Thread(r, "telegram-webhook");
+                t.setDaemon(true);
+                return t;
+            }));
+            webhookServer.start();
+            log.info("Telegram webhook server started on port " + webhookConfig.port());
+        } catch (IOException e) {
+            status = ChannelStatus.error(channelId(), "Failed to start webhook server: " + e.getMessage());
+            throw new RuntimeException("Failed to start webhook server", e);
+        }
+    }
+
+    private void stopWebhookServer() {
+        if (webhookServer != null) {
+            webhookServer.stop(1);
+            webhookServer = null;
+        }
+        // Delete webhook from Telegram (best effort)
+        try {
+            apiGet("deleteWebhook").join();
+        } catch (Exception e) {
+            log.fine("Failed to delete webhook: " + e.getMessage());
+        }
+    }
+
+    // -- Update processing (shared between polling and webhook) --
 
     private void processUpdates(String body) {
         // Find all update blocks using update_id as anchor
