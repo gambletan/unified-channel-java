@@ -31,7 +31,7 @@ Built for the agentic era: plug this into your LLM orchestration pipeline (LangC
 │       ┌──────────────┼──────────────┐                │
 │       ▼              ▼              ▼                │
 │  ┌─────────┐  ┌───────────┐  ┌──────────┐          │
-│  │ Access  │  │  Command  │  │ Custom   │          │
+│  │ Access  │  │  Command  │  │ Memory   │          │
 │  │Middleware│  │Middleware │  │Middleware │          │
 │  └─────────┘  └───────────┘  └──────────┘          │
 │                      │                               │
@@ -49,19 +49,19 @@ Built for the agentic era: plug this into your LLM orchestration pipeline (LangC
 | Slack | Fully implemented | `SlackAdapter` | Socket Mode + Web API, java.net.http |
 | Mattermost | Fully implemented | `MattermostAdapter` | WebSocket + REST, java.net.http |
 | IRC | Fully implemented | `IRCAdapter` | Raw socket, SSL support |
-| WhatsApp | Stub | `WhatsAppAdapter` | Cloud API planned |
-| Matrix | Stub | `MatrixAdapter` | Client-Server API planned |
-| MS Teams | Stub | `MSTeamsAdapter` | Bot Framework planned |
-| LINE | Stub | `LineAdapter` | Messaging API planned |
-| Feishu | Stub | `FeishuAdapter` | Open API planned |
-| Google Chat | Stub | `GoogleChatAdapter` | Chat API planned |
-| Nextcloud | Stub | `NextcloudAdapter` | Talk API planned |
-| Synology | Stub | `SynologyAdapter` | Chat API planned |
-| Zalo | Stub | `ZaloAdapter` | OA API planned |
-| Nostr | Stub | `NostrAdapter` | NIP-01 planned |
-| BlueBubbles | Stub | `BlueBubblesAdapter` | REST API planned |
-| Twitch | Stub | `TwitchAdapter` | IRC/EventSub planned |
-| iMessage | Stub | `IMessageAdapter` | AppleScript bridge planned |
+| WhatsApp | Fully implemented | `WhatsAppAdapter` | Cloud API webhook + REST |
+| Matrix | Fully implemented | `MatrixAdapter` | /sync polling + REST |
+| MS Teams | Fully implemented | `MSTeamsAdapter` | Bot Framework webhook + REST |
+| LINE | Fully implemented | `LineAdapter` | Webhook + push API |
+| Feishu | Fully implemented | `FeishuAdapter` | Event subscription + REST, token refresh |
+| Google Chat | Fully implemented | `GoogleChatAdapter` | Webhook + REST |
+| Nextcloud | Fully implemented | `NextcloudAdapter` | OCS REST polling |
+| Synology | Fully implemented | `SynologyAdapter` | Incoming/outgoing webhooks |
+| Zalo | Fully implemented | `ZaloAdapter` | Webhook + OA API |
+| Nostr | Fully implemented | `NostrAdapter` | WebSocket relay, NIP-01 |
+| BlueBubbles | Fully implemented | `BlueBubblesAdapter` | REST polling |
+| Twitch | Fully implemented | `TwitchAdapter` | IRC over TLS |
+| iMessage | Fully implemented | `IMessageAdapter` | macOS sqlite3 + osascript |
 
 ## Quick Start
 
@@ -105,19 +105,144 @@ manager.onMessage(msg -> {
 manager.run().join();
 ```
 
+## ServiceBridge
+
+The `ServiceBridge` is a high-level wrapper that exposes application functions as chat commands with auto-generated `/help`.
+
+```java
+var manager = new ChannelManager();
+manager.addChannel(new TelegramAdapter(System.getenv("TELEGRAM_TOKEN")));
+
+var bridge = new ServiceBridge(manager)
+    .expose("deploy", args -> deployService(args[0]), "Deploy a service")
+    .expose("restart", args -> restartService(args[0]), "Restart a service")
+    .exposeStatus(() -> getServiceStatus())
+    .exposeLogs(args -> tailLogs(args.length > 0 ? Integer.parseInt(args[0]) : 20));
+
+// Auto-generates: /help, /deploy, /restart, /status, /logs
+bridge.run();
+```
+
+## YAML Configuration
+
+Load channels and middleware from a YAML config file with `${ENV_VAR}` interpolation:
+
+```yaml
+# config.yml
+channels:
+  telegram:
+    token: ${TELEGRAM_TOKEN}
+  discord:
+    token: ${DISCORD_TOKEN}
+  slack:
+    botToken: ${SLACK_BOT_TOKEN}
+    appToken: ${SLACK_APP_TOKEN}
+
+middleware:
+  access:
+    allowedUsers:
+      - admin-user-123
+      - operator-456
+```
+
+```java
+var manager = Config.loadConfig("config.yml");
+manager.onMessage(msg -> {
+    // Handle messages from all configured channels
+});
+manager.run().join();
+```
+
+## Conversation Memory
+
+The `ConversationMemory` middleware tracks conversation history per chat, with pluggable storage backends.
+
+```java
+// In-memory (default)
+var memory = new ConversationMemory();
+
+// SQLite-backed (persistent)
+var memory = new ConversationMemory(new SQLiteStore("conversations.db"), 100);
+
+manager.addMiddleware(memory);
+manager.onMessage(msg -> {
+    // History is available in message metadata
+    @SuppressWarnings("unchecked")
+    var history = (List<HistoryEntry>) msg.raw().get("history");
+
+    // Feed history to your LLM for context-aware responses
+    var reply = yourAgent.chatWithHistory(msg.text(), history);
+    manager.send(msg.channelId(), OutboundMessage.text(msg.chatId(), reply));
+});
+```
+
+## Rich Replies
+
+Build multi-part replies with tables, code blocks, images, and buttons:
+
+```java
+var reply = new RichReply()
+    .text("Server Status Report")
+    .divider()
+    .table(
+        List.of("Service", "Status", "Latency"),
+        List.of(
+            List.of("API", "UP", "12ms"),
+            List.of("Database", "UP", "3ms"),
+            List.of("Cache", "DOWN", "N/A")))
+    .divider()
+    .code("{ \"uptime\": \"3d 12h\" }", "json")
+    .buttons(List.of(List.of(
+        new Button("Restart Cache", "restart_cache"),
+        new Button("View Logs", "view_logs"))));
+
+manager.send("telegram", reply.toOutbound("telegram", chatId));
+// Or get plain text: reply.toPlainText()
+```
+
+## Streaming Middleware
+
+Show typing indicators while processing messages (useful for LLM responses):
+
+```java
+var streaming = new StreamingMiddleware((channelId, chatId) -> {
+    // Send platform-specific typing indicator
+    manager.send(channelId, OutboundMessage.builder()
+        .chatId(chatId).text("typing...").build());
+});
+manager.addMiddleware(streaming);
+```
+
+Use `StreamingReply` to collect chunked LLM responses:
+
+```java
+var chunks = llm.streamChat(message);  // returns Iterator<String>
+var reply = new StreamingReply(chunks);
+var fullText = reply.collect();
+```
+
 ## Core Concepts
 
 ### ChannelAdapter
 Interface for bridging a messaging platform. Implements `connect()`, `disconnect()`, `send()`, and `onMessage()`.
 
 ### Middleware
-Intercepts inbound messages before they reach your handlers. Chain multiple middleware for access control, command routing, logging, rate limiting, etc.
+Intercepts inbound messages before they reach your handlers. Chain multiple middleware for access control, command routing, conversation memory, typing indicators, and more.
+
+### ServiceBridge
+High-level wrapper that exposes functions as chat commands with auto-generated help.
 
 ### HandlerResult
 Sealed interface with three variants: `Empty` (consumed/dropped), `TextReply`, `MessageReply`.
 
 ### UnifiedMessage / OutboundMessage
 Normalized message types with builders for ergonomic construction.
+
+### RichReply
+Builder for multi-part messages with text, tables, code blocks, images, and buttons.
+
+### ConversationMemory
+Middleware that tracks per-chat conversation history with pluggable storage (in-memory or SQLite).
 
 ## Building
 
